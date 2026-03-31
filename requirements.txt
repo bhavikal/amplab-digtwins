@@ -1,7 +1,6 @@
 mne>=1.8.0
 pandas>=2.2.3
-numpy>=2.1.1
+numpy>=1.26,<2.3
 scipy>=1.14.1
 matplotlib>=3.9.0
 torch>=2.5.0
-eeggan>=0.1.0
