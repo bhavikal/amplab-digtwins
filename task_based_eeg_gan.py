@@ -36,6 +36,22 @@ class EEGSegmentDataset(Dataset):
         return segment.flatten()  # (n_channels * n_timepoints,)
 
 
+class EEGSegmentFileDataset(Dataset):
+    """Disk-backed Dataset that loads one segment file at a time."""
+
+    def __init__(self, segment_files: List[str]):
+        if not segment_files:
+            raise ValueError("segment_files is empty")
+        self.segment_files = list(segment_files)
+
+    def __len__(self):
+        return len(self.segment_files)
+
+    def __getitem__(self, idx):
+        segment = np.load(self.segment_files[idx]).astype(np.float32)
+        return torch.from_numpy(segment.flatten())
+
+
 class Generator(nn.Module):
     """Generator network: noise -> EEG"""
     
@@ -101,8 +117,9 @@ class TaskGANTrainer:
     """WGAN trainer for task-based EEG"""
     
     def __init__(self, 
-                 segments: np.ndarray,
+                 segments: Optional[np.ndarray],
                  task_name: str,
+                 segment_files: Optional[List[str]] = None,
                  device: str = 'cpu',
                  latent_dim: int = 100,
                  batch_size: int = 32,
@@ -115,6 +132,7 @@ class TaskGANTrainer:
         """
         Args:
             segments: preprocessed EEG segments (n_segments, n_channels, n_timepoints)
+            segment_files: list of per-segment .npy files for streaming from disk
             task_name: name of the task
             device: 'cpu' or 'cuda'
             latent_dim: dimension of noise vector
@@ -134,17 +152,35 @@ class TaskGANTrainer:
         self.n_critic = n_critic
         self.weight_clip = weight_clip
 
-        if segments.ndim != 3:
-            raise ValueError("segments must have shape (n_segments, n_channels, n_timepoints)")
-        if segments.shape[0] == 0:
-            raise ValueError("segments is empty; at least one segment is required for training")
-        
-        # Keep full segment tensor on CPU; batches are moved to device during training.
-        self.segments = torch.FloatTensor(segments)
-        self.input_dim = segments.shape[1] * segments.shape[2]
-        
+        if segments is None and (segment_files is None or len(segment_files) == 0):
+            raise ValueError("Provide either in-memory segments or non-empty segment_files")
+
+        self.data_mode = 'array' if segments is not None else 'files'
+        self.segments = None
+        self.segment_files = None
+
+        if segments is not None:
+            if segments.ndim != 3:
+                raise ValueError("segments must have shape (n_segments, n_channels, n_timepoints)")
+            if segments.shape[0] == 0:
+                raise ValueError("segments is empty; at least one segment is required for training")
+
+            # Keep full segment tensor on CPU; batches are moved to device during training.
+            self.segments = torch.FloatTensor(segments)
+            self.input_dim = segments.shape[1] * segments.shape[2]
+            self.n_segments = int(segments.shape[0])
+            dataset = EEGSegmentDataset(segments)
+        else:
+            assert segment_files is not None
+            self.segment_files = list(segment_files)
+            first_segment = np.load(self.segment_files[0], mmap_mode='r')
+            if first_segment.ndim != 2:
+                raise ValueError("segment files must each have shape (n_channels, n_timepoints)")
+            self.input_dim = int(first_segment.shape[0] * first_segment.shape[1])
+            self.n_segments = int(len(self.segment_files))
+            dataset = EEGSegmentFileDataset(self.segment_files)
+
         # Create data loader
-        dataset = EEGSegmentDataset(segments)
         self.dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -238,6 +274,7 @@ class TaskGANTrainer:
 
         print(f"\nTraining {self.task_name} GAN for {n_epochs} epochs...")
         print(f"  Input dimension: {self.input_dim}")
+        print(f"  Segments: {self.n_segments} ({self.data_mode} mode)")
         print(f"  Batch size: {self.batch_size}")
         print(f"  Device: {self.device}")
         
@@ -275,13 +312,23 @@ class TaskGANTrainer:
         """
         self.generator.eval()
 
-        n_samples = min(n_sample_points, len(self.segments))
+        n_samples = min(n_sample_points, self.n_segments)
         if n_samples < 2:
             return float('nan')
 
         # Sample real data
-        real_indices = np.random.choice(len(self.segments), size=n_samples, replace=False)
-        real_samples = self.segments[real_indices].view(n_samples, -1).cpu().numpy()
+        if self.data_mode == 'array':
+            assert self.segments is not None
+            real_indices = np.random.choice(len(self.segments), size=n_samples, replace=False)
+            real_samples = self.segments[real_indices].view(n_samples, -1).cpu().numpy()
+        else:
+            assert self.segment_files is not None
+            file_indices = np.random.choice(len(self.segment_files), size=n_samples, replace=False)
+            real_samples = []
+            for idx in file_indices:
+                segment = np.load(self.segment_files[idx]).astype(np.float32)
+                real_samples.append(segment.reshape(-1))
+            real_samples = np.stack(real_samples, axis=0)
 
         # Generate fake data matched by sample count
         with torch.no_grad():
@@ -362,7 +409,8 @@ def train_task_gans(preprocessed_data_dir: str, output_dir: str = './task_gan_mo
                    n_critic: int = 5,
                    weight_clip: float = 0.01,
                    max_segments_per_task: Optional[int] = None,
-                   num_workers: int = 0) -> Dict:
+                   num_workers: int = 0,
+                   prefer_streaming: bool = True) -> Dict:
     """
     Train GANs for all available tasks
     """
@@ -411,20 +459,35 @@ def train_task_gans(preprocessed_data_dir: str, output_dir: str = './task_gan_mo
         print(f"{'=' * 80}")
         
         try:
-            # Load segments
-            segments, metadata = data_manager.load_task_segments(task_name)
+            task_dir = Path(preprocessed_data_dir) / task_name
+            individual_dir = task_dir / f'{task_name}_segments_individual'
+            segment_files = sorted(str(p) for p in individual_dir.glob('*.npy')) if individual_dir.exists() else []
 
-            if max_segments_per_task is not None and len(segments) > max_segments_per_task:
-                keep_idx = np.random.choice(len(segments), size=max_segments_per_task, replace=False)
-                segments = segments[keep_idx]
-                print(f"Subsampled to {len(segments)} segments (max_segments_per_task={max_segments_per_task})")
+            use_streaming = prefer_streaming and len(segment_files) > 0
+            segments = None
 
-            print(f"Loaded {len(segments)} segments: {segments.shape}")
+            if use_streaming:
+                if max_segments_per_task is not None and len(segment_files) > max_segments_per_task:
+                    keep_idx = np.random.choice(len(segment_files), size=max_segments_per_task, replace=False)
+                    segment_files = [segment_files[i] for i in keep_idx]
+                    print(f"Subsampled to {len(segment_files)} segment files (max_segments_per_task={max_segments_per_task})")
+                print(f"Using disk-streaming: {len(segment_files)} individual segment files")
+            else:
+                # Fallback to legacy in-memory array path
+                segments, metadata = data_manager.load_task_segments(task_name)
+
+                if max_segments_per_task is not None and len(segments) > max_segments_per_task:
+                    keep_idx = np.random.choice(len(segments), size=max_segments_per_task, replace=False)
+                    segments = segments[keep_idx]
+                    print(f"Subsampled to {len(segments)} segments (max_segments_per_task={max_segments_per_task})")
+
+                print(f"Loaded {len(segments)} segments: {segments.shape}")
             
             # Create trainer
             trainer = TaskGANTrainer(
                 segments=segments,
                 task_name=task_name,
+                segment_files=segment_files if use_streaming else None,
                 device=device,
                 latent_dim=latent_dim,
                 batch_size=batch_size,
@@ -452,7 +515,7 @@ def train_task_gans(preprocessed_data_dir: str, output_dir: str = './task_gan_mo
             results[task_name] = {
                 'train_result': train_result,
                 'mmd': float(mmd),
-                'n_segments': len(segments),
+                'n_segments': int(trainer.n_segments),
                 'model_dir': str(model_dir)
             }
         
@@ -507,6 +570,10 @@ if __name__ == '__main__':
                         help='Optional cap to subsample segments per task for memory/runtime control.')
     parser.add_argument('--num-workers', '--num_workers', type=int, default=0,
                         help='DataLoader workers (default: 0).')
+    parser.add_argument('--prefer-streaming', dest='prefer_streaming', action='store_true', default=True,
+                        help='Prefer per-segment disk streaming when individual segment files are present (default: enabled).')
+    parser.add_argument('--no-prefer-streaming', dest='prefer_streaming', action='store_false',
+                        help='Disable disk-streaming preference and load combined arrays into RAM when available.')
     parser.add_argument('--skip-tasks', '--skip_tasks', nargs='*', default=None,
                         help='Optional list of task names to skip.')
     args = parser.parse_args()
@@ -527,5 +594,6 @@ if __name__ == '__main__':
         n_critic=args.n_critic,
         weight_clip=args.weight_clip,
         max_segments_per_task=args.max_segments_per_task,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        prefer_streaming=args.prefer_streaming
     )

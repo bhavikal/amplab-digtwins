@@ -56,12 +56,7 @@ class HBNTaskDataLoader:
     
     def load_task_data(self, task_name: str, max_files: int = None) -> List[mne.io.Raw]:
         """Load all .set files for a given task"""
-        if task_name not in self.task_files:
-            raise ValueError(f"Unknown task: {task_name}")
-        
-        files = self.task_files[task_name]
-        if max_files:
-            files = files[:max_files]
+        files = self.get_task_files(task_name, max_files=max_files)
         
         raw_list = []
         for fpath in files:
@@ -73,6 +68,16 @@ class HBNTaskDataLoader:
                 print(f"Error loading {os.path.basename(fpath)}: {e}")
         
         return raw_list
+
+    def get_task_files(self, task_name: str, max_files: int = None) -> List[str]:
+        """Return .set file paths for a task without loading them into memory."""
+        if task_name not in self.task_files:
+            raise ValueError(f"Unknown task: {task_name}")
+
+        files = self.task_files[task_name]
+        if max_files:
+            files = files[:max_files]
+        return files
     
     def get_task_metadata(self) -> pd.DataFrame:
         """Return summary of available tasks"""
@@ -220,28 +225,39 @@ class TaskEEGDataManager:
     def __init__(self, output_dir: str = './task_gan_data'):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def prepare_task_dir(self, task_name: str, overwrite: bool = False) -> Tuple[Path, Path]:
+        """Create task output folders and optionally clear prior individual segment files."""
+        task_dir = self.output_dir / task_name
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        segments_dir = task_dir / f'{task_name}_segments_individual'
+        if overwrite and segments_dir.exists():
+            for old_file in segments_dir.glob('*.npy'):
+                old_file.unlink()
+        segments_dir.mkdir(exist_ok=True)
+
+        return task_dir, segments_dir
+
+    def save_task_metadata(self, task_name: str, metadata: Dict):
+        """Save metadata JSON for a task."""
+        task_dir = self.output_dir / task_name
+        task_dir.mkdir(parents=True, exist_ok=True)
+        metadata_file = task_dir / f'{task_name}_metadata.json'
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
     
     def save_task_segments(self, task_name: str, segments: np.ndarray, 
                           metadata: Dict, overwrite: bool = False) -> str:
         """Save preprocessed segments for a task"""
-        task_dir = self.output_dir / task_name
-        task_dir.mkdir(parents=True, exist_ok=True)
+        task_dir, segments_dir = self.prepare_task_dir(task_name, overwrite=overwrite)
         
         # Save full array
         segments_file = task_dir / f'{task_name}_segments.npy'
         np.save(segments_file, segments)
         
         # Save metadata
-        metadata_file = task_dir / f'{task_name}_metadata.json'
-        with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2, default=str)
-        
-        # Save individual segments
-        segments_dir = task_dir / f'{task_name}_segments_individual'
-        if overwrite and segments_dir.exists():
-            for old_file in segments_dir.glob('*.npy'):
-                old_file.unlink()
-        segments_dir.mkdir(exist_ok=True)
+        self.save_task_metadata(task_name, metadata)
         
         for idx, seg in enumerate(segments):
             seg_file = segments_dir / f'{task_name}_segment_{idx:05d}.npy'
@@ -289,7 +305,10 @@ class TaskEEGDataManager:
 
 
 def process_all_hbn_tasks(raw_data_dir: str, output_dir: str = './task_gan_data',
-                         segment_duration: float = 2.0, max_files_per_task: int = None) -> Dict:
+                         segment_duration: float = 2.0, max_files_per_task: int = None,
+                         streaming: bool = True,
+                         write_combined_array: bool = False,
+                         overwrite: bool = False) -> Dict:
     """
     Process all available HBN tasks
     """
@@ -320,30 +339,111 @@ def process_all_hbn_tasks(raw_data_dir: str, output_dir: str = './task_gan_data'
         try:
             # Load task files
             max_files = max_files_per_task if max_files_per_task else None
-            raw_list = loader.load_task_data(task_name, max_files=max_files)
-            
-            if len(raw_list) == 0:
-                print(f"Could not load any files for {task_name}")
-                continue
-            
-            print(f"Loaded {len(raw_list)} files")
-            
-            # Process
-            segments, metadata = preprocessor.process_task_files(
-                raw_list, 
-                segment_duration=segment_duration
-            )
-            
-            # Save
-            task_dir = data_manager.save_task_segments(
-                task_name, segments, metadata
-            )
-            
-            results[task_name] = {
-                'n_segments': len(segments),
-                'shape': segments.shape,
-                'output_dir': task_dir
-            }
+            if streaming:
+                file_paths = loader.get_task_files(task_name, max_files=max_files)
+                if len(file_paths) == 0:
+                    print(f"Could not find any files for {task_name}")
+                    continue
+
+                task_dir, segments_dir = data_manager.prepare_task_dir(task_name, overwrite=overwrite)
+                print(f"Streaming {len(file_paths)} files to {segments_dir}")
+
+                ch_names = None
+                sfreq = None
+                all_segments = []
+                total_segments = 0
+                files_processed = 0
+                files_failed = 0
+
+                for file_idx, fpath in enumerate(file_paths, start=1):
+                    try:
+                        raw = mne.io.read_raw_eeglab(fpath, preload=True)
+                        raw_proc = preprocessor.preprocess_raw(raw)
+
+                        if ch_names is None:
+                            ch_names = raw_proc.ch_names
+                            sfreq = raw_proc.info['sfreq']
+
+                        segments = preprocessor.extract_segments(raw_proc, segment_duration)
+                        if segments.size == 0:
+                            continue
+
+                        segments = preprocessor.normalize_segments(segments)
+
+                        for seg in segments:
+                            seg_file = segments_dir / f'{task_name}_segment_{total_segments:07d}.npy'
+                            np.save(seg_file, seg)
+                            total_segments += 1
+
+                        if write_combined_array:
+                            all_segments.append(segments)
+
+                        files_processed += 1
+                        if file_idx % 25 == 0:
+                            print(f"  Processed {file_idx}/{len(file_paths)} files | segments so far: {total_segments}")
+
+                    except Exception as file_error:
+                        files_failed += 1
+                        print(f"Error processing {os.path.basename(fpath)}: {file_error}")
+
+                if total_segments == 0:
+                    print(f"No valid segments extracted for {task_name}")
+                    continue
+
+                metadata = {
+                    'n_segments': int(total_segments),
+                    'n_channels': int(ch_names and len(ch_names) or 0),
+                    'n_timepoints': int(segment_duration * sfreq) if sfreq else 0,
+                    'sfreq': sfreq,
+                    'segment_duration': segment_duration,
+                    'ch_names': [str(name) for name in (ch_names or [])],
+                    'n_files': int(files_processed),
+                    'n_input_files': int(len(file_paths)),
+                    'n_failed_files': int(files_failed),
+                    'l_freq': preprocessor.l_freq,
+                    'h_freq': preprocessor.h_freq,
+                    'streaming_mode': True,
+                    'individual_segments_dir': f'{task_name}_segments_individual'
+                }
+                data_manager.save_task_metadata(task_name, metadata)
+
+                if write_combined_array and all_segments:
+                    combined = np.concatenate(all_segments, axis=0)
+                    np.save(task_dir / f'{task_name}_segments.npy', combined)
+                    print(f"  Wrote combined array: {combined.shape}")
+
+                print(f"Saved {task_name}: {total_segments} streamed segments")
+                results[task_name] = {
+                    'n_segments': total_segments,
+                    'output_dir': str(task_dir),
+                    'streaming_mode': True
+                }
+            else:
+                raw_list = loader.load_task_data(task_name, max_files=max_files)
+
+                if len(raw_list) == 0:
+                    print(f"Could not load any files for {task_name}")
+                    continue
+
+                print(f"Loaded {len(raw_list)} files")
+
+                # Process
+                segments, metadata = preprocessor.process_task_files(
+                    raw_list,
+                    segment_duration=segment_duration
+                )
+
+                # Save
+                task_dir = data_manager.save_task_segments(
+                    task_name, segments, metadata, overwrite=overwrite
+                )
+
+                results[task_name] = {
+                    'n_segments': len(segments),
+                    'shape': segments.shape,
+                    'output_dir': task_dir,
+                    'streaming_mode': False
+                }
         
         except Exception as e:
             print(f"Error processing {task_name}: {e}")
@@ -370,6 +470,14 @@ if __name__ == '__main__':
                         help='Segment duration in seconds (default: 2.0).')
     parser.add_argument('--max-files-per-task', '--max_files_per_task', type=int, default=None,
                         help='Optional max files per task for quick tests.')
+    parser.add_argument('--streaming', dest='streaming', action='store_true', default=True,
+                        help='Stream files and save individual segments without holding full task arrays in RAM (default: enabled).')
+    parser.add_argument('--no-streaming', dest='streaming', action='store_false',
+                        help='Disable streaming mode and use legacy in-memory task concatenation.')
+    parser.add_argument('--write-combined-array', '--write_combined_array', action='store_true',
+                        help='Also write task-level combined *_segments.npy arrays (can be memory-heavy for full dataset).')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Remove existing per-task individual segment files before writing new outputs.')
     args = parser.parse_args()
 
     # Run pipeline
@@ -377,7 +485,10 @@ if __name__ == '__main__':
         raw_data_dir=args.raw_data_dir,
         output_dir=args.output_dir,
         segment_duration=args.segment_duration,
-        max_files_per_task=args.max_files_per_task
+        max_files_per_task=args.max_files_per_task,
+        streaming=args.streaming,
+        write_combined_array=args.write_combined_array,
+        overwrite=args.overwrite
     )
     
     print("\nPreprocessing Results:")

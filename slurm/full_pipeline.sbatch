@@ -24,6 +24,7 @@ RAW_DIR="${RAW_DIR:-$PROJECT_DIR/raw/ds005515}"
 DATA_DIR="${DATA_DIR:-$PROJECT_DIR/task_gan_data}"
 MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/task_gan_models}"
 SEG_DUR="${SEG_DUR:-2.0}"
+WRITE_COMBINED="${WRITE_COMBINED:-0}"
 MAX_FILES="${MAX_FILES:-}"
 EPOCHS="${EPOCHS:-100}"
 MODEL_PRESET="${MODEL_PRESET:-full}"
@@ -38,14 +39,21 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate eeg-gans
 
 echo "[$(date)] Step 1/2: Preprocessing"
-if [[ -n "$MAX_FILES" ]]; then
-  python task_based_eeg_preprocessing.py "$RAW_DIR" "$DATA_DIR" \
-    --segment-duration "$SEG_DUR" \
-    --max-files-per-task "$MAX_FILES"
-else
-  python task_based_eeg_preprocessing.py "$RAW_DIR" "$DATA_DIR" \
-    --segment-duration "$SEG_DUR"
+PRE_CMD=(
+  python task_based_eeg_preprocessing.py "$RAW_DIR" "$DATA_DIR"
+  --segment-duration "$SEG_DUR"
+  --streaming
+)
+
+if [[ "$WRITE_COMBINED" == "1" ]]; then
+  PRE_CMD+=(--write-combined-array)
 fi
+
+if [[ -n "$MAX_FILES" ]]; then
+  PRE_CMD+=(--max-files-per-task "$MAX_FILES")
+fi
+
+"${PRE_CMD[@]}"
 
 echo "[$(date)] Step 2/2: GAN training"
 CMD=(
@@ -53,6 +61,7 @@ CMD=(
   --device cuda
   --model-preset "$MODEL_PRESET"
   --batch-size "$BATCH"
+  --prefer-streaming
 )
 
 if [[ -n "$MAX_SEGS" ]]; then
