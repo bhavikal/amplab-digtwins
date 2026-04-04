@@ -2,8 +2,8 @@
 #SBATCH -J hbn-task-gan
 #SBATCH -p gpu
 #SBATCH -N 1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64g
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32g
 #SBATCH --gpus=1
 #SBATCH -t 12:00:00
 #SBATCH -o logs/train_%j.out
@@ -14,7 +14,7 @@ set -euo pipefail
 # Usage:
 # sbatch slurm/train_task_gans.sbatch
 # Optional overrides:
-# sbatch --export=ALL,DATA_DIR=/work/users/$USER/eeg-project/task_gan_data,MODEL_DIR=/work/users/$USER/eeg-project/task_gan_models,EPOCHS=100,MODEL_PRESET=base,BATCH=32,MAX_SEGS= slurm/train_task_gans.sbatch
+# sbatch --export=ALL,DATA_DIR=/work/users/$USER/eeg-project/task_gan_data,MODEL_DIR=/work/users/$USER/eeg-project/task_gan_models,EPOCHS=50,MODEL_PRESET=base,BATCH=24,MAX_SEGS=5000 slurm/train_task_gans.sbatch
 # Smoke test profile:
 # sbatch --export=ALL,EPOCHS=10,MODEL_PRESET=small,BATCH=8,MAX_SEGS=1000 slurm/train_task_gans.sbatch
 
@@ -24,17 +24,30 @@ module load conda/latest
 PROJECT_DIR="${PROJECT_DIR:-$SLURM_SUBMIT_DIR}"
 DATA_DIR="${DATA_DIR:-$PROJECT_DIR/task_gan_data}"
 MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/task_gan_models}"
-EPOCHS="${EPOCHS:-100}"
-MODEL_PRESET="${MODEL_PRESET:-full}"
-BATCH="${BATCH:-32}"
+EPOCHS="${EPOCHS:-20}"
+MODEL_PRESET="${MODEL_PRESET:-small}"
+BATCH="${BATCH:-16}"
 LATENT="${LATENT:-100}"
 N_CRITIC="${N_CRITIC:-5}"
 WCLIP="${WCLIP:-0.01}"
-MAX_SEGS="${MAX_SEGS:-}"
+MAX_SEGS="${MAX_SEGS:-2500}"
 SKIP_TASKS="${SKIP_TASKS:-}"
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$MODEL_DIR"
+
+if [[ ! -d "$DATA_DIR" ]]; then
+  echo "ERROR: Preprocessed data directory not found: $DATA_DIR"
+  echo "This is a train-only job. Point DATA_DIR to an existing preprocessed task_gan_data directory."
+  exit 1
+fi
+
+if ! ls "$DATA_DIR"/*/*_metadata.json >/dev/null 2>&1; then
+  echo "ERROR: No task metadata files found under $DATA_DIR"
+  echo "Expected files like: <task>/<task>_metadata.json"
+  echo "This train-only job will not run preprocessing."
+  exit 1
+fi
 
 cd "$PROJECT_DIR"
 source "$(conda info --base)/etc/profile.d/conda.sh"
